@@ -1,13 +1,3 @@
-
-#' Parse Data of R Code as an 'XML' Tree
-#'
-#' Convert the output of 'utils::getParseData()' to an 'XML' tree, that is
-#' searchable and easier to manipulate in general.
-#'
-#' @docType package
-#' @name xmlparsedata
-NULL
-
 #' Convert R parse data to XML
 #'
 #' In recent R versions the parser can attach source code location
@@ -67,7 +57,7 @@ xml_parse_data <- function(x, includeText = NA, pretty = FALSE) {
 
   ## Maybe it is already a data frame, e.g. when used in lintr
   if (is.data.frame(x)) {
-    pd <- x
+    pd <- copy(x)
   } else {
     pd <- getParseData(x, includeText = includeText)
     if (is.null(pd)) {
@@ -85,79 +75,84 @@ xml_parse_data <- function(x, includeText = NA, pretty = FALSE) {
     return(paste0(xml_header, xml_footer))
   }
 
-  pd <- fix_comments(pd)
-
-  if (!is.data.frame(x)) {
-    # workaround for R parser bug #18323; see #25
-    str_const_mismatch <- pd$token == "STR_CONST" &
-      pd$col2 - pd$col1 != nchar(pd$text) - 1L &
+  setDT(pd)
+  fix_comments_inplace(pd)
+  
+  has_text <- "text" %in% names(pd)
+  if (!is.data.frame(x) && has_text) {
+    pd[
+      # workaround for R parser bug #18323; see #25
       # skip if there are tabs, which would require complicating the logic a lot
-      !grepl("\t", pd$text, fixed = TRUE)
-    if (any(str_const_mismatch)) {
-      pd$text[str_const_mismatch] <- reparse_octal(pd[str_const_mismatch, ], attr(x, "srcfile")$lines)
-    }
+      token == "STR_CONST" & col2 - col1 != nchar(text) - 1L & !grepl("\t", text, fixed = TRUE),
+      text := reparse_octal(.SD, attr(x, "srcfile")$lines)
+    ]
   }
 
   if (!is.null(pd$text)) {
-    pd$text <- enc2utf8(pd$text)
+    pd[, text := enc2utf8(text)]
   }
 
   ## Tags for all nodes, teminal nodes have end tags as well
-  pd$token <- map_token(pd$token)
+  pd[, token := map_token(token)]
 
   ## Positions, to make it easy to compare what comes first
-  maxcol <- max(pd$col1, pd$col2) + 1L
-  pd$start <- pd$line1 * maxcol + pd$col1
-  pd$end <- pd$line2 * maxcol + pd$col2
+  pd[, c("start", "end") := {
+    maxcol = max(col1, col2) + 1L
+    list(line1 * maxcol + col1, line2 * maxcol + col2)
+  }]
 
-  terminal_tag <- character(nrow(pd))
-  terminal_tag[pd$terminal] <- paste0("</", pd$token[pd$terminal], ">")
+  pd[, terminal_tag := character(.N)]
+  pd[(terminal), terminal_tag := paste0("</", token, ">")]
   if (anyNA(pd$line1)) {
-    pd$tag <- paste0(
-      "<", pd$token, ">",
-      if (!is.null(pd$text)) xml_encode(pd$text) else "",
+    pd[, tag := paste0(
+      "<", token, ">",
+      if (has_text) xml_encode(text) else "",
       terminal_tag
-    )
+    )]
   } else {
-    pd$tag <- paste0(
-      "<", pd$token,
-      " line1=\"", pd$line1,
-      "\" col1=\"", pd$col1,
-      "\" line2=\"", pd$line2,
-      "\" col2=\"", pd$col2,
-      "\" start=\"", pd$start,
-      "\" end=\"", pd$end,
+    pd[, tag := paste0(
+      "<", token,
+      " line1=\"", line1,
+      "\" col1=\"", col1,
+      "\" line2=\"", line2,
+      "\" col2=\"", col2,
+      "\" start=\"", start,
+      "\" end=\"", end,
       "\">",
-      if (!is.null(pd$text)) xml_encode(pd$text) else "",
+      if (has_text) xml_encode(text) else "",
       terminal_tag
-    )
+    )]
   }
+  pd[, "terminal_tag" := NULL]
 
   ## Add an extra terminal tag for each non-terminal one
-  pd2 <- pd[!pd$terminal, ]
+  pd2 <- pd[(!terminal), ]
   if (nrow(pd2)) {
-    pd2$terminal <- TRUE
-    pd2$parent <- -1
-    pd2$line1 <- pd2$line2
-    pd2$col1 <- pd2$col2
-    pd2$line2 <- pd2$line2 - 1L
-    pd2$col2 <- pd2$col2 - 1L
-    pd2$tag <- paste0("</", pd2$token, ">")
-    pd <- rbind(pd, pd2, make.row.names = FALSE)
+    pd2[, `:=`(
+      terminal = TRUE,
+      parent = -1,
+      line1 = line2,
+      col1 = col2,
+      line2 = line2 - 1L,
+      col2 = col2 - 1L,
+      tag = paste0("</", token, ">")
+    )]
+    pd <- rbind(pd, pd2)
   }
 
   ## Order the nodes properly
   ## - the terminal nodes from pd2 may be nested inside each other, when
   ##   this happens they will have the same line1, col1, line2, col2 and
   ##   terminal status; and 'start' is used to break ties
-  ord <- order(pd$line1, pd$col1, -pd$line2, -pd$col2, pd$terminal, -pd$start)
-  pd <- pd[ord, ]
+  setorder(pd, line1, col1, -line2, -col2, terminal, -start)
 
   if (pretty) {
-    str <- !pd$terminal
-    end <- pd$parent == -1
-    ind <- 2L + cumsum(str * 2L + end * (-2L)) - str * 2L
-    xml <- paste0(strrep(" ", ind), pd$tag, collapse = "\n")
+    xml <- pd[, {
+      str <- !terminal
+      end <- parent == -1
+      ind <- 2L + cumsum(str * 2L + end * (-2L)) - str * 2L
+      paste0(strrep(" ", ind), tag, collapse = "\n")
+    }]
   } else {
     xml <- paste(pd$tag, collapse = "\n")
   }
@@ -165,9 +160,8 @@ xml_parse_data <- function(x, includeText = NA, pretty = FALSE) {
   paste0(xml_header, xml, xml_footer)
 }
 
-fix_comments <- function(pd) {
-  pd$parent[pd$parent < 0] <- 0
-  pd
+fix_comments_inplace <- function(pd) {
+  pd[parent < 0, parent := 0]
 }
 
 map_token <- function(token) {

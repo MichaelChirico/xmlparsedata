@@ -1,5 +1,8 @@
 
 reparse_octal <- function(pd, lines) {
+  if (nrow(pd) == 0L) {
+    return(character())
+  }
   out <- character(nrow(pd))
   single_line <- pd$line1 == pd$line2
   out[single_line] <- substr(lines[pd$line1[single_line]], pd$col1[single_line], pd$col2[single_line])
